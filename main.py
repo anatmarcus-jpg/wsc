@@ -141,7 +141,6 @@ def check_goals(game, league):
 
 # ── Main loop ──────────────────────────────────────────────────
 def poll_loop():
-    send_slack_message("⚽ *Dutch Football Goal Alert Bot is live!*\nWatching Eredivisie & Eerste Divisie for goals... 🇳🇱")
     while True:
         try:
             for league in LEAGUES:
