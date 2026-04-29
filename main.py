@@ -10,9 +10,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# --- Config ---
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_CHANNEL_ID = "C0AVATSHKNX"  # test-espnnl-goal
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 LEAGUES = [
     {"id": "ned.1", "name": "Eredivisie", "flag": "🇳🇱"},
@@ -20,39 +20,57 @@ LEAGUES = [
 ]
 
 POLL_INTERVAL = 30  # seconds
+KEEPALIVE_INTERVAL = 600  # ping self every 10 minutes
+
 score_cache = {}
 
 
-# Minimal HTTP server so Render's web service stays alive
+# ── Health server ──────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Dutch Football Alert Bot is running!")
-    def log_message(self, format, *args):
-        pass  # suppress access logs
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass
 
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
+# ── Keep-alive ping ────────────────────────────────────────────
+def keep_alive():
+    while True:
+        time.sleep(KEEPALIVE_INTERVAL)
+        if RENDER_URL:
+            try:
+                requests.get(RENDER_URL, timeout=10)
+                logging.info("Keep-alive ping sent.")
+            except Exception as e:
+                logging.warning(f"Keep-alive failed: {e}")
+
+
+# ── Slack ──────────────────────────────────────────────────────
 def send_slack_message(text):
-    res = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={"channel": SLACK_CHANNEL_ID, "text": text},
-        timeout=10,
-    )
-    data = res.json()
-    if not data.get("ok"):
-        logging.error(f"Slack error: {data.get('error')}")
-    else:
-        logging.info("Slack message sent.")
+    try:
+        res = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": SLACK_CHANNEL_ID, "text": text},
+            timeout=10,
+        )
+        data = res.json()
+        if not data.get("ok"):
+            logging.error(f"Slack error: {data.get('error')}")
+        else:
+            logging.info("Slack message sent.")
+    except Exception as e:
+        logging.error(f"Slack request failed: {e}")
 
 
+# ── ESPN ───────────────────────────────────────────────────────
 def get_games(league_id):
     url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}/scoreboard"
     try:
@@ -60,7 +78,7 @@ def get_games(league_id):
         res.raise_for_status()
         return res.json().get("events", [])
     except Exception as e:
-        logging.error(f"ESPN fetch error ({league_id}): {e}")
+        logging.error(f"ESPN error ({league_id}): {e}")
         return []
 
 
@@ -89,7 +107,10 @@ def check_goals(game, league):
     as_ = game["away_score"]
     status = game["status"].lower()
 
-    if not any(s in status for s in ["progress", "halftime", "period"]):
+    is_live = any(s in status for s in ["progress", "halftime", "period"])
+    is_finished = any(s in status for s in ["final", "full time", "ft"])
+
+    if not is_live and not is_finished:
         return
 
     prev = score_cache.get(gid)
@@ -98,14 +119,17 @@ def check_goals(game, league):
         logging.info(f"Tracking: {game['home_team']} vs {game['away_team']} [{game['status']}]")
         return
 
-    for _ in range(max(0, hs - prev["home"])):
+    home_goals = hs - prev["home"]
+    away_goals = as_ - prev["away"]
+
+    for _ in range(max(0, home_goals)):
         send_slack_message(
             f"{league['flag']} *GOAL!* — {league['name']}\n"
             f"⚽ *{game['home_team']}* score! ⏱️ {game['clock']}\n"
             f"📊 *{game['home_team']} {hs} – {as_} {game['away_team']}*"
         )
 
-    for _ in range(max(0, as_ - prev["away"])):
+    for _ in range(max(0, away_goals)):
         send_slack_message(
             f"{league['flag']} *GOAL!* — {league['name']}\n"
             f"⚽ *{game['away_team']}* score! ⏱️ {game['clock']}\n"
@@ -115,23 +139,31 @@ def check_goals(game, league):
     score_cache[gid] = {"home": hs, "away": as_}
 
 
+# ── Main loop ──────────────────────────────────────────────────
 def poll_loop():
     send_slack_message("⚽ *Dutch Football Goal Alert Bot is live!*\nWatching Eredivisie & Eerste Divisie for goals... 🇳🇱")
     while True:
-        for league in LEAGUES:
-            events = get_games(league["id"])
-            logging.info(f"{league['name']}: {len(events)} games")
-            for event in events:
-                game = parse_game(event)
-                if game:
-                    check_goals(game, league)
+        try:
+            for league in LEAGUES:
+                events = get_games(league["id"])
+                logging.info(f"{league['name']}: {len(events)} games")
+                for event in events:
+                    game = parse_game(event)
+                    if game:
+                        check_goals(game, league)
+        except Exception as e:
+            logging.error(f"Poll loop error: {e}")
         time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    # Start health server in background thread
-    t = threading.Thread(target=start_health_server, daemon=True)
-    t.start()
+    # Health server
+    threading.Thread(target=start_health_server, daemon=True).start()
     logging.info("Health server started.")
+
+    # Keep-alive pinger
+    threading.Thread(target=keep_alive, daemon=True).start()
+    logging.info("Keep-alive thread started.")
+
     # Start polling
     poll_loop()
