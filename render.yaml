@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: dutch-football-alerts
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: SLACK_BOT_TOKEN
+        sync: false
