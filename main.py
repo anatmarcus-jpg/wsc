@@ -2,7 +2,6 @@ import requests
 import os
 import logging
 import time
-from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -13,8 +12,16 @@ POLL_INTERVAL = 15
 score_cache = {}
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://www.sofascore.com/"
 }
+
+# Sofascore tournament IDs
+TOURNAMENTS = [
+    (37, "Eredivisie", "🇳🇱"),
+    (38, "Eerste Divisie", "🇳🇱"),
+]
 
 
 def send_slack_message(text):
@@ -34,94 +41,47 @@ def send_slack_message(text):
         logging.error(f"Slack error: {e}")
 
 
-def get_live_scores():
-    """Scrape live scores from sofascore API - free and real-time."""
+def get_live_games():
+    """Get all live Dutch football games from Sofascore."""
     games = []
     
-    # Sofascore has a public API that powers their website
-    # Get today's Eredivisie (tournament ID 37) and Eerste Divisie (tournament ID 38)
-    for tournament_id, league_name in [("37", "Eredivisie"), ("38", "Eerste Divisie")]:
-        try:
-            url = f"https://api.sofascore.com/api/v1/sport/football/scheduled-events/today"
-            res = requests.get(url, headers=HEADERS, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            events = data.get("events", [])
-            
-            for event in events:
-                tournament = event.get("tournament", {})
-                if tournament.get("uniqueTournament", {}).get("id") in [37, 38, 1390, 1391]:
-                    home = event.get("homeTeam", {}).get("name", "")
-                    away = event.get("awayTeam", {}).get("name", "")
-                    hs = event.get("homeScore", {}).get("current", 0) or 0
-                    as_ = event.get("awayScore", {}).get("current", 0) or 0
-                    status = event.get("status", {}).get("type", "")
-                    minute = event.get("time", {}).get("currentPeriodStartTimestamp", "")
-                    game_id = str(event.get("id", ""))
-                    league = event.get("tournament", {}).get("name", league_name)
-                    
-                    if status in ["inprogress"]:
-                        games.append({
-                            "id": game_id,
-                            "home": home,
-                            "away": away,
-                            "home_score": int(hs),
-                            "away_score": int(as_),
-                            "status": status,
-                            "minute": event.get("time", {}).get("played", "?"),
-                            "league": league,
-                            "flag": "🇳🇱"
-                        })
-                        logging.info(f"  {home} vs {away} | {hs}-{as_} | {status}")
-            break  # Only need to call once, filter by tournament
-        except Exception as e:
-            logging.error(f"Sofascore error: {e}")
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
-    return games
-
-
-def get_live_scores_v2():
-    """Use Sofascore's tournament-specific endpoint."""
-    games = []
-    
-    # Eredivisie tournament ID on Sofascore = 37
-    # Eerste Divisie = 38
-    for tid, name, flag in [(37, "Eredivisie", "🇳🇱"), (38, "Eerste Divisie", "🇳🇱")]:
+    for tid, name, flag in TOURNAMENTS:
         try:
-            from datetime import datetime
-            today = datetime.utcnow().strftime("%Y-%m-%d")
+            # Use scheduled events for today filtered by tournament
             url = f"https://api.sofascore.com/api/v1/unique-tournament/{tid}/events/live"
             res = requests.get(url, headers=HEADERS, timeout=10)
+            logging.info(f"{name} (live endpoint): status={res.status_code}")
             
             if res.status_code == 200:
                 data = res.json()
                 events = data.get("events", [])
                 logging.info(f"{name}: {len(events)} live events")
-                
-                for event in events:
-                    home = event.get("homeTeam", {}).get("name", "")
-                    away = event.get("awayTeam", {}).get("name", "")
-                    hs = event.get("homeScore", {}).get("current", 0) or 0
-                    as_ = event.get("awayScore", {}).get("current", 0) or 0
-                    status = event.get("status", {}).get("type", "")
-                    minute = event.get("time", {}).get("played", "?")
-                    game_id = str(event.get("id", ""))
-                    
-                    logging.info(f"  {home} vs {away} | {hs}-{as_} | {status} | {minute}'")
-                    
+                for e in events:
+                    hs = e.get("homeScore", {}).get("current", 0) or 0
+                    as_ = e.get("awayScore", {}).get("current", 0) or 0
+                    minute = e.get("time", {}).get("played", "?")
                     games.append({
-                        "id": game_id,
-                        "home": home,
-                        "away": away,
+                        "id": str(e["id"]),
+                        "home": e["homeTeam"]["name"],
+                        "away": e["awayTeam"]["name"],
                         "home_score": int(hs),
                         "away_score": int(as_),
-                        "status": status,
                         "minute": minute,
                         "league": name,
-                        "flag": flag
+                        "flag": flag,
                     })
-        except Exception as e:
-            logging.error(f"Sofascore error ({name}): {e}")
+                    logging.info(f"  {e['homeTeam']['name']} vs {e['awayTeam']['name']} | {hs}-{as_} | {minute}'")
+            else:
+                # Try scheduled events for today as fallback
+                url2 = f"https://api.sofascore.com/api/v1/unique-tournament/{tid}/season/current/events/last/0"
+                res2 = requests.get(url2, headers=HEADERS, timeout=10)
+                logging.info(f"{name} (fallback): status={res2.status_code}")
+                
+        except Exception as ex:
+            logging.error(f"Error fetching {name}: {ex}")
     
     return games
 
@@ -134,7 +94,7 @@ def check_goals(game):
     prev = score_cache.get(gid)
     if prev is None:
         score_cache[gid] = {"home": hs, "away": as_}
-        logging.info(f"  --> Now tracking at {hs}-{as_}")
+        logging.info(f"  --> Now tracking {game['home']} vs {game['away']} at {hs}-{as_}")
         return
 
     home_goals = hs - prev["home"]
@@ -158,10 +118,10 @@ def check_goals(game):
 
 
 def main():
-    logging.info("Bot started — using Sofascore live data, polling every 15 seconds.")
+    logging.info("Bot started — Sofascore live data, polling every 15 seconds.")
     while True:
         try:
-            games = get_live_scores_v2()
+            games = get_live_games()
             logging.info(f"Total live games: {len(games)}")
             for game in games:
                 check_goals(game)
