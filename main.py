@@ -9,8 +9,6 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_CHANNEL_ID = "C0AVATSHKNX"
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY")
 
-# football-data.org competition IDs
-# DED = Eredivisie, need to check for Eerste Divisie
 COMPETITIONS = [
     {"code": "DED", "name": "Eredivisie", "flag": "🇳🇱"},
 ]
@@ -36,10 +34,32 @@ def send_slack_message(text):
         logging.error(f"Slack error: {e}")
 
 
+def get_score(match):
+    """Extract current score correctly from football-data.org response."""
+    score = match.get("score", {})
+    
+    # Try current score first
+    current = score.get("fullTime", {})
+    home = current.get("home")
+    away = current.get("away")
+    
+    # If fullTime is null, try halfTime
+    if home is None or away is None:
+        half = score.get("halfTime", {})
+        home = half.get("home")
+        away = half.get("away")
+    
+    # If still null, default to 0
+    if home is None: home = 0
+    if away is None: away = 0
+    
+    return int(home), int(away)
+
+
 def get_live_matches(competition_code):
     url = f"https://api.football-data.org/v4/competitions/{competition_code}/matches"
     headers = {"X-Auth-Token": FOOTBALL_API_KEY}
-    params = {"status": "LIVE,IN_PLAY,PAUSED"}
+    params = {"status": "IN_PLAY,PAUSED"}
     try:
         res = requests.get(url, headers=headers, params=params, timeout=10)
         res.raise_for_status()
@@ -57,30 +77,34 @@ def check_goals(match, league_name, flag):
     status = match.get("status", "")
     home_team = match["homeTeam"]["name"]
     away_team = match["awayTeam"]["name"]
-    hs = match["score"]["fullTime"]["home"] or match["score"]["halfTime"]["home"] or 0
-    as_ = match["score"]["fullTime"]["away"] or match["score"]["halfTime"]["away"] or 0
-    minute = match.get("minute", "")
+    hs, as_ = get_score(match)
+    minute = match.get("minute", "?")
 
-    logging.info(f"  {home_team} vs {away_team} | {hs}-{as_} | status={status} | minute={minute}")
+    logging.info(f"  {home_team} vs {away_team} | {hs}-{as_} | status={status} | minute={minute}'")
 
-    is_live = status in ["IN_PLAY", "PAUSED", "LIVE"]
+    is_live = status in ["IN_PLAY", "PAUSED"]
     if not is_live:
         return
 
     prev = score_cache.get(mid)
     if prev is None:
         score_cache[mid] = {"home": hs, "away": as_}
-        logging.info(f"  --> Now tracking!")
+        logging.info(f"  --> Now tracking at {hs}-{as_}")
         return
 
-    for _ in range(max(0, hs - prev["home"])):
+    home_goals = hs - prev["home"]
+    away_goals = as_ - prev["away"]
+
+    logging.info(f"  Score change: prev={prev['home']}-{prev['away']} now={hs}-{as_}")
+
+    for _ in range(max(0, home_goals)):
         send_slack_message(
             f"{flag} *GOAL!* — {league_name}\n"
             f"⚽ *{home_team}* score! ⏱️ {minute}'\n"
             f"📊 *{home_team} {hs} – {as_} {away_team}*"
         )
 
-    for _ in range(max(0, as_ - prev["away"])):
+    for _ in range(max(0, away_goals)):
         send_slack_message(
             f"{flag} *GOAL!* — {league_name}\n"
             f"⚽ *{away_team}* score! ⏱️ {minute}'\n"
