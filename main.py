@@ -13,7 +13,7 @@ LEAGUES = [
     {"id": "ned.2", "name": "Eerste Divisie", "flag": "🇳🇱"},
 ]
 
-POLL_INTERVAL = 15  # seconds
+POLL_INTERVAL = 15
 score_cache = {}
 
 
@@ -57,6 +57,7 @@ def parse_game(event):
             "home_score": int(home.get("score", 0) or 0),
             "away_score": int(away.get("score", 0) or 0),
             "status": event["status"]["type"]["description"],
+            "status_type": event["status"]["type"]["name"],
             "clock": event["status"].get("displayClock", ""),
         }
     except Exception as e:
@@ -69,15 +70,24 @@ def check_goals(game, league):
     hs = game["home_score"]
     as_ = game["away_score"]
     status = game["status"].lower()
+    status_type = game["status_type"].lower()
 
-    is_live = any(s in status for s in ["progress", "halftime", "period"])
+    # Log every game status so we can debug
+    logging.info(f"  {game['home_team']} vs {game['away_team']} | {hs}-{as_} | status={game['status']} | type={game['status_type']}")
+
+    # Accept any non-scheduled, non-postponed status as potentially live
+    is_live = (
+        any(s in status for s in ["progress", "halftime", "period", "live"]) or
+        any(s in status_type for s in ["in", "progress", "live", "half"])
+    )
+
     if not is_live:
         return
 
     prev = score_cache.get(gid)
     if prev is None:
         score_cache[gid] = {"home": hs, "away": as_}
-        logging.info(f"Tracking: {game['home_team']} vs {game['away_team']} [{game['status']}] {hs}-{as_}")
+        logging.info(f"  --> Now tracking!")
         return
 
     for _ in range(max(0, hs - prev["home"])):
