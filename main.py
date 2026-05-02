@@ -11,16 +11,12 @@ SLACK_CHANNEL_ID = "C0AVATSHKNX"
 POLL_INTERVAL = 15
 score_cache = {}
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Referer": "https://www.sofascore.com/"
-}
-
-# Sofascore tournament IDs
-TOURNAMENTS = [
-    (37, "Eredivisie", "🇳🇱"),
-    (38, "Eerste Divisie", "🇳🇱"),
+# Try multiple ESPN league IDs for Dutch football
+ESPN_LEAGUES = [
+    ("ned.1", "Eredivisie", "🇳🇱"),
+    ("ned.2", "Eerste Divisie", "🇳🇱"),
+    ("ned.3", "Eredivisie Playoffs", "🇳🇱"),
+    ("ned.4", "Netherlands Cup", "🇳🇱"),
 ]
 
 
@@ -41,76 +37,89 @@ def send_slack_message(text):
         logging.error(f"Slack error: {e}")
 
 
-def get_live_games():
-    """Get all live Dutch football games from Sofascore."""
-    games = []
-    
-    from datetime import datetime, timezone
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    
-    for tid, name, flag in TOURNAMENTS:
-        try:
-            # Use scheduled events for today filtered by tournament
-            url = f"https://api.sofascore.com/api/v1/unique-tournament/{tid}/events/live"
-            res = requests.get(url, headers=HEADERS, timeout=10)
-            logging.info(f"{name} (live endpoint): status={res.status_code}")
-            
-            if res.status_code == 200:
-                data = res.json()
-                events = data.get("events", [])
-                logging.info(f"{name}: {len(events)} live events")
-                for e in events:
-                    hs = e.get("homeScore", {}).get("current", 0) or 0
-                    as_ = e.get("awayScore", {}).get("current", 0) or 0
-                    minute = e.get("time", {}).get("played", "?")
-                    games.append({
-                        "id": str(e["id"]),
-                        "home": e["homeTeam"]["name"],
-                        "away": e["awayTeam"]["name"],
-                        "home_score": int(hs),
-                        "away_score": int(as_),
-                        "minute": minute,
-                        "league": name,
-                        "flag": flag,
-                    })
-                    logging.info(f"  {e['homeTeam']['name']} vs {e['awayTeam']['name']} | {hs}-{as_} | {minute}'")
-            else:
-                # Try scheduled events for today as fallback
-                url2 = f"https://api.sofascore.com/api/v1/unique-tournament/{tid}/season/current/events/last/0"
-                res2 = requests.get(url2, headers=HEADERS, timeout=10)
-                logging.info(f"{name} (fallback): status={res2.status_code}")
-                
-        except Exception as ex:
-            logging.error(f"Error fetching {name}: {ex}")
-    
-    return games
+def get_espn_games(league_id):
+    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}/scoreboard"
+    try:
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        events = res.json().get("events", [])
+        return events
+    except Exception as e:
+        logging.error(f"ESPN error ({league_id}): {e}")
+        return []
+
+
+def parse_espn_game(event, league_name, flag):
+    try:
+        comp = event["competitions"][0]
+        home = next(t for t in comp["competitors"] if t["homeAway"] == "home")
+        away = next(t for t in comp["competitors"] if t["homeAway"] == "away")
+        status = event["status"]["type"]["description"]
+        status_type = event["status"]["type"]["name"]
+        
+        # Get score from details if available
+        home_score = int(home.get("score", 0) or 0)
+        away_score = int(away.get("score", 0) or 0)
+        
+        # Try to get score from linescores
+        if "linescores" in home:
+            total = sum(int(ls.get("value", 0) or 0) for ls in home["linescores"])
+            if total > 0:
+                home_score = total
+        if "linescores" in away:
+            total = sum(int(ls.get("value", 0) or 0) for ls in away["linescores"])
+            if total > 0:
+                away_score = total
+
+        return {
+            "id": event["id"],
+            "home": home["team"]["displayName"],
+            "away": away["team"]["displayName"],
+            "home_score": home_score,
+            "away_score": away_score,
+            "status": status,
+            "status_type": status_type,
+            "clock": event["status"].get("displayClock", ""),
+            "league": league_name,
+            "flag": flag,
+        }
+    except Exception as e:
+        logging.warning(f"Parse error: {e}")
+        return None
 
 
 def check_goals(game):
     gid = game["id"]
     hs = game["home_score"]
     as_ = game["away_score"]
+    status = game["status"].lower()
+    status_type = game["status_type"].lower()
+
+    is_live = any(s in status for s in ["progress", "halftime", "half time"]) or \
+              any(s in status_type for s in ["in", "progress", "half"])
+
+    logging.info(f"  {game['home']} vs {game['away']} | {hs}-{as_} | {game['status']} | live={is_live}")
+
+    if not is_live:
+        return
 
     prev = score_cache.get(gid)
     if prev is None:
         score_cache[gid] = {"home": hs, "away": as_}
-        logging.info(f"  --> Now tracking {game['home']} vs {game['away']} at {hs}-{as_}")
+        logging.info(f"  --> Tracking at {hs}-{as_}")
         return
 
-    home_goals = hs - prev["home"]
-    away_goals = as_ - prev["away"]
-
-    for _ in range(max(0, home_goals)):
+    for _ in range(max(0, hs - prev["home"])):
         send_slack_message(
             f"{game['flag']} *GOAL!* — {game['league']}\n"
-            f"⚽ *{game['home']}* score! ⏱️ {game['minute']}'\n"
+            f"⚽ *{game['home']}* score! ⏱️ {game['clock']}\n"
             f"📊 *{game['home']} {hs} – {as_} {game['away']}*"
         )
 
-    for _ in range(max(0, away_goals)):
+    for _ in range(max(0, as_ - prev["away"])):
         send_slack_message(
             f"{game['flag']} *GOAL!* — {game['league']}\n"
-            f"⚽ *{game['away']}* score! ⏱️ {game['minute']}'\n"
+            f"⚽ *{game['away']}* score! ⏱️ {game['clock']}\n"
             f"📊 *{game['home']} {hs} – {as_} {game['away']}*"
         )
 
@@ -118,13 +127,16 @@ def check_goals(game):
 
 
 def main():
-    logging.info("Bot started — Sofascore live data, polling every 15 seconds.")
+    logging.info("Bot started — ESPN multi-league polling every 15 seconds.")
     while True:
         try:
-            games = get_live_games()
-            logging.info(f"Total live games: {len(games)}")
-            for game in games:
-                check_goals(game)
+            for league_id, league_name, flag in ESPN_LEAGUES:
+                events = get_espn_games(league_id)
+                logging.info(f"{league_name}: {len(events)} games")
+                for event in events:
+                    game = parse_espn_game(event, league_name, flag)
+                    if game:
+                        check_goals(game)
         except Exception as e:
             logging.error(f"Poll error: {e}")
         time.sleep(POLL_INTERVAL)
