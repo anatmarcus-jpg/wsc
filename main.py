@@ -2,7 +2,6 @@ import requests
 import os
 import logging
 import time
-import json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -36,17 +35,14 @@ def send_slack_message(text):
 
 
 def get_score(match):
-    """Extract current score - log full score object to debug."""
+    """Extract current score - fullTime is updated live by football-data.org."""
     score = match.get("score", {})
-    # Log entire score object to see what fields are available
-    logging.info(f"  SCORE OBJECT: {json.dumps(score)}")
-    
-    # Try all possible score fields
-    for field in ["regularTime", "currentPeriod", "fullTime", "halfTime", "extraTime"]:
-        s = score.get(field, {})
-        if s and s.get("home") is not None and s.get("away") is not None:
-            return int(s["home"]), int(s["away"])
-    
+    # fullTime is updated in real-time during the match
+    ft = score.get("fullTime", {})
+    home = ft.get("home")
+    away = ft.get("away")
+    if home is not None and away is not None:
+        return int(home), int(away)
     return 0, 0
 
 
