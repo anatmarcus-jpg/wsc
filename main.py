@@ -1,6 +1,5 @@
 import requests
 import os
-import json
 import logging
 import time
 
@@ -14,20 +13,8 @@ LEAGUES = [
     {"id": "ned.2", "name": "Eerste Divisie", "flag": "🇳🇱"},
 ]
 
-STATE_FILE = "state.json"
-
-
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except:
-        return {}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+POLL_INTERVAL = 15  # seconds
+score_cache = {}
 
 
 def send_slack_message(text):
@@ -77,7 +64,7 @@ def parse_game(event):
         return None
 
 
-def check_goals(game, league, state):
+def check_goals(game, league):
     gid = game["id"]
     hs = game["home_score"]
     as_ = game["away_score"]
@@ -87,51 +74,43 @@ def check_goals(game, league, state):
     if not is_live:
         return
 
-    prev = state.get(gid)
+    prev = score_cache.get(gid)
     if prev is None:
-        state[gid] = {"home": hs, "away": as_}
+        score_cache[gid] = {"home": hs, "away": as_}
         logging.info(f"Tracking: {game['home_team']} vs {game['away_team']} [{game['status']}] {hs}-{as_}")
         return
 
-    home_goals = hs - prev["home"]
-    away_goals = as_ - prev["away"]
-
-    for _ in range(max(0, home_goals)):
+    for _ in range(max(0, hs - prev["home"])):
         send_slack_message(
             f"{league['flag']} *GOAL!* — {league['name']}\n"
             f"⚽ *{game['home_team']}* score! ⏱️ {game['clock']}\n"
             f"📊 *{game['home_team']} {hs} – {as_} {game['away_team']}*"
         )
 
-    for _ in range(max(0, away_goals)):
+    for _ in range(max(0, as_ - prev["away"])):
         send_slack_message(
             f"{league['flag']} *GOAL!* — {league['name']}\n"
             f"⚽ *{game['away_team']}* score! ⏱️ {game['clock']}\n"
             f"📊 *{game['home_team']} {hs} – {as_} {game['away_team']}*"
         )
 
-    state[gid] = {"home": hs, "away": as_}
-
-
-def poll_once(state):
-    for league in LEAGUES:
-        events = get_games(league["id"])
-        logging.info(f"{league['name']}: {len(events)} games")
-        for event in events:
-            game = parse_game(event)
-            if game:
-                check_goals(game, league, state)
-    save_state(state)
+    score_cache[gid] = {"home": hs, "away": as_}
 
 
 def main():
-    # Run every 20 seconds for 5 minutes (15 polls per GitHub Action run)
-    state = load_state()
-    for i in range(15):
-        logging.info(f"Poll {i+1}/15")
-        poll_once(state)
-        if i < 14:
-            time.sleep(20)
+    logging.info("Bot started — polling every 15 seconds.")
+    while True:
+        try:
+            for league in LEAGUES:
+                events = get_games(league["id"])
+                logging.info(f"{league['name']}: {len(events)} games")
+                for event in events:
+                    game = parse_game(event)
+                    if game:
+                        check_goals(game, league)
+        except Exception as e:
+            logging.error(f"Poll error: {e}")
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
