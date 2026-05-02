@@ -2,12 +2,13 @@ name: Goal Alert
 
 on:
   schedule:
-    - cron: '* * * * *'  # every minute
+    - cron: '*/5 * * * *'  # every 5 minutes
   workflow_dispatch:
 
 jobs:
   check-goals:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
 
