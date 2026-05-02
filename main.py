@@ -1,58 +1,34 @@
-import time
 import requests
 import os
+import json
 import logging
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-SLACK_CHANNEL_ID = "C0AVATSHKNX"  # test-espnnl-goal
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+SLACK_CHANNEL_ID = "C0AVATSHKNX"
 
 LEAGUES = [
     {"id": "ned.1", "name": "Eredivisie", "flag": "🇳🇱"},
     {"id": "ned.2", "name": "Eerste Divisie", "flag": "🇳🇱"},
 ]
 
-POLL_INTERVAL = 30  # seconds
-KEEPALIVE_INTERVAL = 600  # ping self every 10 minutes
-
-score_cache = {}
+STATE_FILE = "state.json"
 
 
-# ── Health server ──────────────────────────────────────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
 
 
-def start_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
 
-# ── Keep-alive ping ────────────────────────────────────────────
-def keep_alive():
-    while True:
-        time.sleep(KEEPALIVE_INTERVAL)
-        if RENDER_URL:
-            try:
-                requests.get(RENDER_URL, timeout=10)
-                logging.info("Keep-alive ping sent.")
-            except Exception as e:
-                logging.warning(f"Keep-alive failed: {e}")
-
-
-# ── Slack ──────────────────────────────────────────────────────
 def send_slack_message(text):
     try:
         res = requests.post(
@@ -67,10 +43,9 @@ def send_slack_message(text):
         else:
             logging.info("Slack message sent.")
     except Exception as e:
-        logging.error(f"Slack request failed: {e}")
+        logging.error(f"Slack error: {e}")
 
 
-# ── ESPN ───────────────────────────────────────────────────────
 def get_games(league_id):
     url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}/scoreboard"
     try:
@@ -101,68 +76,50 @@ def parse_game(event):
         return None
 
 
-def check_goals(game, league):
-    gid = game["id"]
-    hs = game["home_score"]
-    as_ = game["away_score"]
-    status = game["status"].lower()
+def main():
+    state = load_state()
 
-    is_live = any(s in status for s in ["progress", "halftime", "period"])
-    is_finished = any(s in status for s in ["final", "full time", "ft"])
+    for league in LEAGUES:
+        events = get_games(league["id"])
+        logging.info(f"{league['name']}: {len(events)} games")
 
-    if not is_live and not is_finished:
-        return
+        for event in events:
+            game = parse_game(event)
+            if not game:
+                continue
 
-    prev = score_cache.get(gid)
-    if prev is None:
-        score_cache[gid] = {"home": hs, "away": as_}
-        logging.info(f"Tracking: {game['home_team']} vs {game['away_team']} [{game['status']}]")
-        return
+            status = game["status"].lower()
+            is_live = any(s in status for s in ["progress", "halftime", "period"])
 
-    home_goals = hs - prev["home"]
-    away_goals = as_ - prev["away"]
+            if not is_live:
+                continue
 
-    for _ in range(max(0, home_goals)):
-        send_slack_message(
-            f"{league['flag']} *GOAL!* — {league['name']}\n"
-            f"⚽ *{game['home_team']}* score! ⏱️ {game['clock']}\n"
-            f"📊 *{game['home_team']} {hs} – {as_} {game['away_team']}*"
-        )
+            gid = game["id"]
+            hs = game["home_score"]
+            as_ = game["away_score"]
+            prev = state.get(gid, {"home": hs, "away": as_})
 
-    for _ in range(max(0, away_goals)):
-        send_slack_message(
-            f"{league['flag']} *GOAL!* — {league['name']}\n"
-            f"⚽ *{game['away_team']}* score! ⏱️ {game['clock']}\n"
-            f"📊 *{game['home_team']} {hs} – {as_} {game['away_team']}*"
-        )
+            home_goals = hs - prev["home"]
+            away_goals = as_ - prev["away"]
 
-    score_cache[gid] = {"home": hs, "away": as_}
+            for _ in range(max(0, home_goals)):
+                send_slack_message(
+                    f"{league['flag']} *GOAL!* — {league['name']}\n"
+                    f"⚽ *{game['home_team']}* score! ⏱️ {game['clock']}\n"
+                    f"📊 *{game['home_team']} {hs} – {as_} {game['away_team']}*"
+                )
 
+            for _ in range(max(0, away_goals)):
+                send_slack_message(
+                    f"{league['flag']} *GOAL!* — {league['name']}\n"
+                    f"⚽ *{game['away_team']}* score! ⏱️ {game['clock']}\n"
+                    f"📊 *{game['home_team']} {hs} – {as_} {game['away_team']}*"
+                )
 
-# ── Main loop ──────────────────────────────────────────────────
-def poll_loop():
-    while True:
-        try:
-            for league in LEAGUES:
-                events = get_games(league["id"])
-                logging.info(f"{league['name']}: {len(events)} games")
-                for event in events:
-                    game = parse_game(event)
-                    if game:
-                        check_goals(game, league)
-        except Exception as e:
-            logging.error(f"Poll loop error: {e}")
-        time.sleep(POLL_INTERVAL)
+            state[gid] = {"home": hs, "away": as_}
+
+    save_state(state)
 
 
 if __name__ == "__main__":
-    # Health server
-    threading.Thread(target=start_health_server, daemon=True).start()
-    logging.info("Health server started.")
-
-    # Keep-alive pinger
-    threading.Thread(target=keep_alive, daemon=True).start()
-    logging.info("Keep-alive thread started.")
-
-    # Start polling
-    poll_loop()
+    main()
