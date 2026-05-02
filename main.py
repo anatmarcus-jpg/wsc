@@ -11,13 +11,14 @@ SLACK_CHANNEL_ID = "C0AVATSHKNX"
 POLL_INTERVAL = 15
 score_cache = {}
 
-# Try multiple ESPN league IDs for Dutch football
 ESPN_LEAGUES = [
     ("ned.1", "Eredivisie", "🇳🇱"),
     ("ned.2", "Eerste Divisie", "🇳🇱"),
     ("ned.3", "Eredivisie Playoffs", "🇳🇱"),
-    ("ned.4", "Netherlands Cup", "🇳🇱"),
 ]
+
+# Track which games we've seen with non-zero scores
+seen_with_score = set()
 
 
 def send_slack_message(text):
@@ -42,41 +43,27 @@ def get_espn_games(league_id):
     try:
         res = requests.get(url, timeout=10)
         res.raise_for_status()
-        events = res.json().get("events", [])
-        return events
+        return res.json().get("events", [])
     except Exception as e:
         logging.error(f"ESPN error ({league_id}): {e}")
         return []
 
 
-def parse_espn_game(event, league_name, flag):
+def parse_game(event, league_name, flag):
     try:
         comp = event["competitions"][0]
         home = next(t for t in comp["competitors"] if t["homeAway"] == "home")
         away = next(t for t in comp["competitors"] if t["homeAway"] == "away")
         status = event["status"]["type"]["description"]
         status_type = event["status"]["type"]["name"]
-        
-        # Get score from details if available
-        home_score = int(home.get("score", 0) or 0)
-        away_score = int(away.get("score", 0) or 0)
-        
-        # Try to get score from linescores
-        if "linescores" in home:
-            total = sum(int(ls.get("value", 0) or 0) for ls in home["linescores"])
-            if total > 0:
-                home_score = total
-        if "linescores" in away:
-            total = sum(int(ls.get("value", 0) or 0) for ls in away["linescores"])
-            if total > 0:
-                away_score = total
-
+        hs = int(home.get("score", 0) or 0)
+        as_ = int(away.get("score", 0) or 0)
         return {
             "id": event["id"],
             "home": home["team"]["displayName"],
             "away": away["team"]["displayName"],
-            "home_score": home_score,
-            "away_score": away_score,
+            "home_score": hs,
+            "away_score": as_,
             "status": status,
             "status_type": status_type,
             "clock": event["status"].get("displayClock", ""),
@@ -95,12 +82,27 @@ def check_goals(game):
     status = game["status"].lower()
     status_type = game["status_type"].lower()
 
-    is_live = any(s in status for s in ["progress", "halftime", "half time"]) or \
-              any(s in status_type for s in ["in", "progress", "half"])
+    # Consider a game live if:
+    # 1. Status says in progress/halftime, OR
+    # 2. Score is non-zero (ESPN sometimes keeps status as Scheduled even when live)
+    has_score = hs > 0 or as_ > 0
+    is_live = (
+        any(s in status for s in ["progress", "halftime", "half time"]) or
+        any(s in status_type for s in ["in", "progress", "half"]) or
+        has_score or
+        gid in seen_with_score
+    )
 
-    logging.info(f"  {game['home']} vs {game['away']} | {hs}-{as_} | {game['status']} | live={is_live}")
+    if has_score:
+        seen_with_score.add(gid)
+
+    logging.info(f"  {game['home']} vs {game['away']} | {hs}-{as_} | {game['status']} | tracking={is_live}")
 
     if not is_live:
+        return
+
+    # Don't track finished games
+    if any(s in status for s in ["final", "full time", "ft", "finished"]):
         return
 
     prev = score_cache.get(gid)
@@ -127,14 +129,14 @@ def check_goals(game):
 
 
 def main():
-    logging.info("Bot started — ESPN multi-league polling every 15 seconds.")
+    logging.info("Bot started — polling ESPN every 15 seconds, tracking all score changes.")
     while True:
         try:
             for league_id, league_name, flag in ESPN_LEAGUES:
                 events = get_espn_games(league_id)
                 logging.info(f"{league_name}: {len(events)} games")
                 for event in events:
-                    game = parse_espn_game(event, league_name, flag)
+                    game = parse_game(event, league_name, flag)
                     if game:
                         check_goals(game)
         except Exception as e:
