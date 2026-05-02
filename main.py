@@ -2,6 +2,7 @@ import requests
 import os
 import logging
 import time
+import json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -35,25 +36,18 @@ def send_slack_message(text):
 
 
 def get_score(match):
-    """Extract current score correctly from football-data.org response."""
+    """Extract current score - log full score object to debug."""
     score = match.get("score", {})
+    # Log entire score object to see what fields are available
+    logging.info(f"  SCORE OBJECT: {json.dumps(score)}")
     
-    # Try current score first
-    current = score.get("fullTime", {})
-    home = current.get("home")
-    away = current.get("away")
+    # Try all possible score fields
+    for field in ["regularTime", "currentPeriod", "fullTime", "halfTime", "extraTime"]:
+        s = score.get(field, {})
+        if s and s.get("home") is not None and s.get("away") is not None:
+            return int(s["home"]), int(s["away"])
     
-    # If fullTime is null, try halfTime
-    if home is None or away is None:
-        half = score.get("halfTime", {})
-        home = half.get("home")
-        away = half.get("away")
-    
-    # If still null, default to 0
-    if home is None: home = 0
-    if away is None: away = 0
-    
-    return int(home), int(away)
+    return 0, 0
 
 
 def get_live_matches(competition_code):
@@ -77,8 +71,8 @@ def check_goals(match, league_name, flag):
     status = match.get("status", "")
     home_team = match["homeTeam"]["name"]
     away_team = match["awayTeam"]["name"]
-    hs, as_ = get_score(match)
     minute = match.get("minute", "?")
+    hs, as_ = get_score(match)
 
     logging.info(f"  {home_team} vs {away_team} | {hs}-{as_} | status={status} | minute={minute}'")
 
@@ -95,7 +89,7 @@ def check_goals(match, league_name, flag):
     home_goals = hs - prev["home"]
     away_goals = as_ - prev["away"]
 
-    logging.info(f"  Score change: prev={prev['home']}-{prev['away']} now={hs}-{as_}")
+    logging.info(f"  Change check: prev={prev['home']}-{prev['away']} now={hs}-{as_}")
 
     for _ in range(max(0, home_goals)):
         send_slack_message(
