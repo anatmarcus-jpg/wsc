@@ -2,36 +2,27 @@ import requests
 import os
 import logging
 import time
-import json
+import re
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_CHANNEL_ID = "C0AVATSHKNX"
-FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY")
 
 POLL_INTERVAL = 15
-STATE_FILE = "/tmp/score_cache.json"
+score_cache = {}
 
-COMPETITIONS = [
-    {"code": "DED", "name": "Eredivisie", "flag": "🇳🇱"},
+# Direct ESPN game IDs for today's matches - ned.1 scoreboard
+ESPN_LEAGUES = [
+    ("ned.1", "Eredivisie", "🇳🇱"),
+    ("ned.2", "Eerste Divisie", "🇳🇱"),
+    ("ned.3", "Eredivisie Playoffs", "🇳🇱"),
 ]
 
-
-def load_cache():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except:
-        return {}
-
-
-def save_cache(cache):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(cache, f)
-    except Exception as e:
-        logging.error(f"Cache save error: {e}")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+}
 
 
 def send_slack_message(text):
@@ -51,61 +42,57 @@ def send_slack_message(text):
         logging.error(f"Slack error: {e}")
 
 
-def get_todays_matches(competition_code):
-    """Get all of today's matches regardless of status."""
-    from datetime import datetime, timezone
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    url = f"https://api.football-data.org/v4/competitions/{competition_code}/matches"
-    headers = {"X-Auth-Token": FOOTBALL_API_KEY}
-    params = {"dateFrom": today, "dateTo": today}
+def get_games(league_id):
+    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}/scoreboard"
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res = requests.get(url, headers=HEADERS, timeout=10)
         res.raise_for_status()
-        matches = res.json().get("matches", [])
-        logging.info(f"{competition_code}: {len(matches)} matches today")
-        return matches
+        return res.json().get("events", [])
     except Exception as e:
-        logging.error(f"football-data error: {e}")
+        logging.error(f"ESPN error ({league_id}): {e}")
         return []
 
 
-def get_score(match):
-    """Get current score - football-data updates fullTime live."""
-    score = match.get("score", {})
-    ft = score.get("fullTime", {})
-    home = ft.get("home")
-    away = ft.get("away")
-    if home is not None and away is not None:
-        return int(home), int(away)
-    # Try halfTime as fallback
-    ht = score.get("halfTime", {})
-    home = ht.get("home")
-    away = ht.get("away")
-    if home is not None and away is not None:
-        return int(home), int(away)
-    return 0, 0
+def get_game_detail(game_id, league_id="ned.1"):
+    """Fetch individual game details for more accurate live score."""
+    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}/summary?event={game_id}"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            header = data.get("header", {})
+            comps = header.get("competitions", [])
+            if comps:
+                comp = comps[0]
+                home = next((t for t in comp["competitors"] if t["homeAway"] == "home"), None)
+                away = next((t for t in comp["competitors"] if t["homeAway"] == "away"), None)
+                if home and away:
+                    return {
+                        "home_score": int(home.get("score", 0) or 0),
+                        "away_score": int(away.get("score", 0) or 0),
+                        "status": comp.get("status", {}).get("type", {}).get("description", ""),
+                        "clock": comp.get("status", {}).get("displayClock", ""),
+                    }
+    except Exception as e:
+        logging.error(f"Game detail error ({game_id}): {e}")
+    return None
 
 
-def check_goals(match, league_name, flag, cache):
-    mid = str(match["id"])
-    status = match.get("status", "")
-    home_team = match["homeTeam"]["name"]
-    away_team = match["awayTeam"]["name"]
-    minute = match.get("minute", "?")
-    hs, as_ = get_score(match)
+def check_goals(game_id, home_team, away_team, hs, as_, status, clock, league_name, flag):
+    gid = game_id
+    status_lower = status.lower()
 
-    # Track IN_PLAY and PAUSED games
-    is_live = status in ["IN_PLAY", "PAUSED"]
-    
-    logging.info(f"  {home_team} vs {away_team} | {hs}-{as_} | {status} | {minute}'")
+    is_live = any(s in status_lower for s in ["progress", "halftime", "half time", "first", "second"])
+
+    logging.info(f"  {home_team} vs {away_team} | {hs}-{as_} | {status} | live={is_live}")
 
     if not is_live:
         return
 
-    prev = cache.get(mid)
+    prev = score_cache.get(gid)
     if prev is None:
-        cache[mid] = {"home": hs, "away": as_}
-        logging.info(f"  --> Now tracking at {hs}-{as_}")
+        score_cache[gid] = {"home": hs, "away": as_}
+        logging.info(f"  --> Tracking at {hs}-{as_}")
         return
 
     home_goals = hs - prev["home"]
@@ -116,32 +103,61 @@ def check_goals(match, league_name, flag, cache):
     for _ in range(max(0, home_goals)):
         send_slack_message(
             f"{flag} *GOAL!* — {league_name}\n"
-            f"⚽ *{home_team}* score! ⏱️ {minute}'\n"
+            f"⚽ *{home_team}* score! ⏱️ {clock}\n"
             f"📊 *{home_team} {hs} – {as_} {away_team}*"
         )
 
     for _ in range(max(0, away_goals)):
         send_slack_message(
             f"{flag} *GOAL!* — {league_name}\n"
-            f"⚽ *{away_team}* score! ⏱️ {minute}'\n"
+            f"⚽ *{away_team}* score! ⏱️ {clock}\n"
             f"📊 *{home_team} {hs} – {as_} {away_team}*"
         )
 
-    cache[mid] = {"home": hs, "away": as_}
+    score_cache[gid] = {"home": hs, "away": as_}
 
 
 def main():
-    logging.info("Bot started — football-data.org, polling every 15 seconds.")
-    cache = load_cache()
-    logging.info(f"Loaded cache with {len(cache)} entries.")
-
+    logging.info("Bot started — ESPN summary API, polling every 15 seconds.")
     while True:
         try:
-            for comp in COMPETITIONS:
-                matches = get_todays_matches(comp["code"])
-                for match in matches:
-                    check_goals(match, comp["name"], comp["flag"], cache)
-            save_cache(cache)
+            all_game_ids = {}
+            
+            # First get all games from scoreboard
+            for league_id, league_name, flag in ESPN_LEAGUES:
+                events = get_games(league_id)
+                logging.info(f"{league_name}: {len(events)} games")
+                for event in events:
+                    try:
+                        comp = event["competitions"][0]
+                        home = next(t for t in comp["competitors"] if t["homeAway"] == "home")
+                        away = next(t for t in comp["competitors"] if t["homeAway"] == "away")
+                        all_game_ids[event["id"]] = {
+                            "home": home["team"]["displayName"],
+                            "away": away["team"]["displayName"],
+                            "league": league_name,
+                            "flag": flag,
+                            "league_id": league_id,
+                        }
+                    except:
+                        pass
+
+            # Now fetch each game's detail for accurate live score
+            for game_id, info in all_game_ids.items():
+                detail = get_game_detail(game_id, info["league_id"])
+                if detail:
+                    check_goals(
+                        game_id,
+                        info["home"],
+                        info["away"],
+                        detail["home_score"],
+                        detail["away_score"],
+                        detail["status"],
+                        detail["clock"],
+                        info["league"],
+                        info["flag"],
+                    )
+
         except Exception as e:
             logging.error(f"Poll error: {e}")
         time.sleep(POLL_INTERVAL)
